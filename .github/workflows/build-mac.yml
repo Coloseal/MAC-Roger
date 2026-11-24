@@ -1,0 +1,103 @@
+# Builds Roger for Mac (Apple Silicon / arm64) on GitHub's own Mac computers (free for a public repo)
+# and puts the finished files on a release in THIS repository.
+#
+# How to use it:
+#   Option A: Releases -> "Draft a new release" -> type a new tag such as v1.5.1 -> Publish release.
+#             The build starts by itself and a few minutes later the Mac files appear on that release.
+#   Option B: Actions -> "Build Mac app" -> "Run workflow" -> type the tag (for example v1.5.1).
+#             If that release does not exist yet, it is created for you.
+#
+# The version number inside the app is taken from the tag (v1.5.1 -> 1.5.1), so you never edit it by hand.
+# The app is not notarized by Apple (that needs a paid developer account), so macOS asks you to approve it once.
+# It carries a free "ad-hoc" signature, which Apple Silicon Macs require before they will run any app.
+
+name: Build Mac app
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (for example v1.5.1)"
+        required: true
+        default: "v1.5.1"
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-latest        # Apple Silicon (arm64)
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Work out the version from the tag
+        run: |
+          VER="${TAG#v}"
+          echo "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "The tag must look like v1.5.1 (got: $TAG)"; exit 1; }
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          echo "Building Roger $VER for Mac"
+
+      - name: Install
+        working-directory: desktop
+        run: |
+          npm pkg set version="$VERSION"
+          npm ci
+
+      - name: Build the Mac app (Apple Silicon)
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:mac
+
+      - name: List what was built
+        run: ls -la desktop/dist
+
+      - name: Check it is an Apple Silicon app with a valid signature
+        run: |
+          APP="desktop/dist/mac-arm64/Roger.app"
+          echo "Architecture: $(lipo -archs "$APP/Contents/MacOS/Roger")"
+          lipo -archs "$APP/Contents/MacOS/Roger" | grep -qx arm64
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | grep -E "Signature|Identifier" || true
+
+      - name: Start it once and check it reaches the sign-in page
+        continue-on-error: true       # informational: a slow free server should not stop the release
+        run: node tools/mac-smoke.js desktop/dist/mac-arm64/Roger.app/Contents/MacOS/Roger
+
+      - name: Fingerprints
+        run: |
+          {
+            echo "### Mac files (SHA-256)"
+            echo '```'
+            (cd desktop/dist && shasum -a 256 *-mac-arm64.dmg *-mac-arm64.zip)
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep a copy on the workflow page
+        uses: actions/upload-artifact@v4
+        with:
+          name: Roger-mac-arm64
+          path: |
+            desktop/dist/*-mac-arm64.dmg
+            desktop/dist/*-mac-arm64.zip
+            desktop/dist/latest-mac.yml
+
+      - name: Put the files on the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Roger $VERSION for Mac" --notes-file MAC-RELEASE-NOTES.md
+          fi
+          shopt -s nullglob
+          files=(desktop/dist/*-mac-arm64.dmg desktop/dist/*-mac-arm64.zip desktop/dist/*-mac-arm64.*.blockmap desktop/dist/latest-mac.yml)
+          printf 'Uploading: %s\n' "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" --clobber
